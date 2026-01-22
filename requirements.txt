@@ -1,0 +1,25 @@
+# AI-Sentinel Requirements
+# Core
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# AI/ML
+torch>=2.0.0
+transformers>=4.36.0
+bitsandbytes>=0.41.0  # 4-bit quantization
+accelerate>=0.25.0    # Model loading utilities
+qwen-vl-utils>=0.0.2  # Qwen VL processing utilities
+
+# Vector Database
+chromadb>=0.4.0
+
+# Web UI
+streamlit>=1.28.0
+requests>=2.31.0
+
+# Utilities
+pyyaml>=6.0
+Pillow>=10.0.0
+paddlepaddle>=2.6.0
+paddleocr>=2.7.0
+streamlit-cropper>=0.2.0
