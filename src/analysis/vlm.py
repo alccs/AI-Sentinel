@@ -13,20 +13,36 @@ import io
 logger = logging.getLogger(__name__)
 
 # System prompt for safety-aware scene description
-DEFAULT_SYSTEM_PROMPT = """你是一个专业的安防监控分析AI。请简要描述画面内容（50字以内）。
-如果检测到以下紧急情况，请在描述开头加上对应标记：
-- 有人摔倒或躺在地上：【ALERT: FALL_DETECTED】
-- 出现明火或烟雾：【ALERT: FIRE_DETECTED】
-- 有人打架或暴力行为：【ALERT: VIOLENCE_DETECTED】
-- 有可疑人员闯入或徘徊：【ALERT: INTRUSION_DETECTED】
-如果画面正常，直接描述即可，无需添加标记。"""
+DEFAULT_SYSTEM_PROMPT = """你是一个专业的安防监控分析AI。请你对画面进行分级并描述。
+背景信息：这是一个家庭院落监控。画面左侧是院子和铁门，右侧是一条乡村小路，画面上方（远处）有一条公路和鸡笼。
+注意：请确保输出为单行，不要包含换行符（\n）。
+请按照以下格式返回结果：[L{level}_{type}] {description}。
+
+我们将采用 4 级分级标准:
+[L3_CRITICAL]: 紧急危险 (有人摔倒、火灾、暴力行为、非法闯入、烟雾)
+[L2_WARNING]: 警告关注 (有人在院子里、狗或猫（描述其颜色）、车移动)
+[L1_INFO]: 画面静止 (无人员或动物活动，画面静止)
+
+务必在描述末尾加上监控时间，格式：监控时间：YYYY-MM-DD HH:MM:SS"""
+
+
+# DEFAULT_SYSTEM_PROMPT = """你是一个专业的安防监控分析AI。请你对画面进行分级并描述。
+# 注意：请确保输出为单行，不要包含换行符（\n）。
+# 请按照以下格式返回结果：[L{level}_{type}] {description}。
+
+# 我们将采用 4 级分级标准:
+# [L3_CRITICAL]: 紧急危险 (有人摔倒、火灾、暴力行为、非法闯入)
+# [L2_WARNING]: 警告关注 (有人在院子里、狗或猫、车移动)
+# [L1_INFO]: 画面静止 (无人员或动物活动，画面静止)
+
+# 务必在描述末尾加上监控时间，格式：监控时间：YYYY-MM-DD HH:MM:SS"""
 
 
 class VLMBackend(ABC):
     """Abstract base class for VLM backends."""
     
     @abstractmethod
-    def analyze(self, image_path: str, prompt: str, system_prompt: str) -> str:
+    def analyze(self, image_path: str, prompt: str, system_prompt: str, history: List[str] = None) -> str:
         """Analyze an image and return description."""
         pass
     
@@ -74,10 +90,16 @@ class TransformersBackend(VLMBackend):
             logger.error(f"Failed to load Transformers model: {e}")
             raise
     
-    def analyze(self, image_path: str, prompt: str, system_prompt: str) -> str:
+    def analyze(self, image_path: str, prompt: str, system_prompt: str, history: List[str] = None) -> str:
         self._load_model()
         
         from qwen_vl_utils import process_vision_info
+        
+        # Format prompt with history if available
+        final_prompt = prompt
+        if history and len(history) > 0:
+            context_str = "\n".join([f"- {h}" for h in history])
+            final_prompt = f"Previous Context:\n{context_str}\n\nCurrent Request: {prompt}"
         
         # Construct messages
         messages = [
@@ -140,7 +162,8 @@ class OllamaBackend(VLMBackend):
         url = f"{self.base_url}/api/generate"
         payload = {
             "model": self.model_name,
-            "prompt": prompt,
+            "model": self.model_name,
+            "prompt": final_prompt,
             "system": system_prompt,
             "images": [image_data],
             "stream": False,
@@ -176,12 +199,37 @@ class OpenAICompatibleBackend(VLMBackend):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         
-    def analyze(self, image_path: str, prompt: str, system_prompt: str) -> str:
+    def analyze(self, image_path: str, prompt: str, system_prompt: str, history: List[str] = None) -> str:
         import requests
+        import time as _time
         
-        # Read and encode image
-        with open(image_path, "rb") as f:
-            base64_image = base64.b64encode(f.read()).decode("utf-8")
+        # Format prompt with history if available
+        final_prompt = prompt
+        if history and len(history) > 0:
+            context_str = "\n".join([f"- {h}" for h in history])
+            final_prompt = f"Previous Context:\n{context_str}\n\nCurrent Request: {prompt}"
+        
+        # Read, resize, and encode image to prevent payload size errors with smaller models
+        from PIL import Image
+        import io
+        
+        try:
+            with Image.open(image_path) as img:
+                # Resize if image is too large (max 1920px on longest side to save tokens/payload size)
+                max_size = 1280
+                if max(img.size) > max_size:
+                    img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                
+                # Convert to RGB (in case of PNG with alpha)
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                    
+                img_byte_arr = io.BytesIO()
+                img.save(img_byte_arr, format='JPEG', quality=85)
+                base64_image = base64.b64encode(img_byte_arr.getvalue()).decode("utf-8")
+        except Exception as e:
+            logger.error(f"Error encoding image {image_path}: {e}")
+            return f"[API Error: Image Processing Failed - {str(e)}]"
             
         headers = {
             "Content-Type": "application/json",
@@ -195,7 +243,7 @@ class OpenAICompatibleBackend(VLMBackend):
                 {
                     "role": "user", 
                     "content": [
-                        {"type": "text", "text": prompt},
+                        {"type": "text", "text": final_prompt},
                         {
                             "type": "image_url", 
                             "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
@@ -206,20 +254,54 @@ class OpenAICompatibleBackend(VLMBackend):
             "max_tokens": 300
         }
         
-        try:
-            # Try chat completions endpoint
-            url = f"{self.base_url}/chat/completions"
-            # Handle full URLs vs base URLs
-            if "chat/completions" in self.base_url:
-                url = self.base_url
+        # Retry with exponential backoff for transient errors
+        # LM Studio can only process one request at a time;
+        # concurrent requests return 400/Channel Error
+        max_retries = 3
+        base_delay = 2.0  # seconds
+        
+        url = f"{self.base_url}/chat/completions"
+        if "chat/completions" in self.base_url:
+            url = self.base_url
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=120)
+                response.raise_for_status()
+                result = response.json()
+                return result["choices"][0]["message"]["content"].strip()
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                status_code = e.response.status_code if e.response is not None else 0
                 
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
-            result = response.json()
-            return result["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            logger.error(f"OpenAI API error: {e}")
-            return f"[API Error: {str(e)}]"
+                # Retry on 400 (LM Studio busy/Channel Error), 429 (rate limit), 5xx (server error)
+                if status_code in (400, 429, 502, 503) and attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # 2s, 4s, 8s
+                    logger.warning(
+                        f"VLM API {status_code} error (model={self.model_name}, attempt {attempt+1}/{max_retries}), "
+                        f"retrying in {delay:.0f}s..."
+                    )
+                    _time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"VLM API error (model={self.model_name}): {e}")
+                    return f"[API Error: {str(e)}]"
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"VLM API timeout (attempt {attempt+1}/{max_retries}), retrying in {delay:.0f}s...")
+                    _time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"VLM API timeout after {max_retries} attempts")
+                    return f"[API Error: 请求超时]"
+            except Exception as e:
+                logger.error(f"VLM API unexpected error (model={self.model_name}): {e}")
+                return f"[API Error: {str(e)}]"
+        
+        return f"[API Error: {str(last_error)}]"
 
     def is_available(self) -> bool:
         return True
@@ -231,7 +313,7 @@ class MockBackend(VLMBackend):
     def __init__(self):
         self._call_count = 0
     
-    def analyze(self, image_path: str, prompt: str, system_prompt: str) -> str:
+    def analyze(self, image_path: str, prompt: str, system_prompt: str, history: List[str] = None) -> str:
         self._call_count += 1
         
         # Simulate occasional alerts for testing
@@ -270,6 +352,8 @@ class VLMAnalyzer:
             "api_key": api_key,
         }
         self._backend: VLMBackend = self._init_backend(backend, **self.config)
+        import threading
+        self._lock = threading.Lock()
         logger.info(f"VLMAnalyzer initialized with backend: {type(self._backend).__name__}")
     
     def _init_backend(self, backend: str, **kwargs) -> VLMBackend:
@@ -314,13 +398,14 @@ class VLMAnalyzer:
         
         raise ValueError(f"Unknown backend: {backend}")
     
-    def analyze_frame(self, image_path: str, custom_prompt: str = None) -> str:
+    def analyze_frame(self, image_path: str, custom_prompt: str = None, history: List[str] = None) -> str:
         """
         Analyze a single frame and return description.
         
         Args:
             image_path: Path to the image file
             custom_prompt: Optional custom prompt (uses default if None)
+            history: Optional list of previous analysis results strings
             
         Returns:
             str: Description of the frame, possibly with ALERT tags
@@ -328,7 +413,8 @@ class VLMAnalyzer:
         prompt = custom_prompt or "请分析这张监控画面。"
         
         try:
-            result = self._backend.analyze(image_path, prompt, self.system_prompt)
+            with self._lock:
+                result = self._backend.analyze(image_path, prompt, self.system_prompt, history)
             logger.debug(f"VLM analysis result: {result[:100]}...")
             return result
         except Exception as e:

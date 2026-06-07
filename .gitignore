@@ -1,0 +1,26 @@
+# Configuration (contains API keys, passwords, local paths)
+config/settings.json
+
+# Local database and media files
+data/
+yolov8n.pt
+test_chroma_db/
+
+# Python virtual environment and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Log files
+*.log

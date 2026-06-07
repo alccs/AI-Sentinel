@@ -17,6 +17,24 @@ DEFAULT_CONFIG = {
         "api_url": "https://api.openai.com/v1",
         "api_key": "",
         "model_name": "gpt-4o",
+        "system_prompt": "",  # Custom system prompt (overrides default if set)
+        "presets": {
+            "OpenAI": {
+                "api_url": "https://api.openai.com/v1",
+                "api_key": "",
+                "model_name": "gpt-4o",
+            },
+            "Local (Ollama)": {
+                "api_url": "http://localhost:11434/v1",
+                "api_key": "ollama",
+                "model_name": "qwen2-vl",
+            },
+            "SiliconFlow": {
+                "api_url": "https://api.siliconflow.cn/v1",
+                "api_key": "",
+                "model_name": "Qwen/Qwen2-VL-72B-Instruct",
+            }
+        },  # Stored API presets
     },
     "embedding": {
         "provider": "api",  # "api" or "local"
@@ -29,36 +47,119 @@ DEFAULT_CONFIG = {
     },
     "analysis": {
         "interval": 1.0,
+        "motion_threshold": 5.0,
     },
     "ocr": {
         "roi": [0.65, 0.85, 0.35, 0.15],  # x, y, w, h ratios (default: bottom-right corner)
     },
     "storage": {
-        "max_saved_frames": 50,
+    "max_saved_frames": 50,
     },
+    "alarms": {
+        "rules": {
+            # Default Object Detection Alarms
+            "PERSON": {
+                "enabled": True, 
+                "description": "检测到人", 
+                "severity": "Info", 
+                "icon": "👤",
+                "keywords": "人, 男, 女, 孩, 老, person, man, woman, child"
+            },
+            "DOG": {
+                "enabled": True, 
+                "description": "检测到狗", 
+                "severity": "Info", 
+                "icon": "🐕",
+                "keywords": "狗, 犬, dog, puppy"
+            },
+            "CAT": {
+                "enabled": True, 
+                "description": "检测到猫", 
+                "severity": "Info", 
+                "icon": "🐱",
+                "keywords": "猫, cat, kitten"
+            },
+            "CAR": {
+                "enabled": True, 
+                "description": "检测到车辆", 
+                "severity": "Info", 
+                "icon": "🚗",
+                "keywords": "车, SUV, 轿车, 卡车, car, truck, vehicle, van, bus, SUV"
+            },
+            "CHICKEN": {
+                "enabled": True, 
+                "description": "检测到鸡", 
+                "severity": "Info", 
+                "icon": "🐔",
+                "keywords": "鸡, chicken, rooster, hen"
+            },
+            # Critical Safety Alarms
+            "FALL": {
+                "enabled": True, 
+                "description": "检测到跌倒", 
+                "severity": "Critical", 
+                "icon": "⚠️",
+                "keywords": "摔倒, 倒地, 跌倒, fall, collapse, ground"
+            },
+            "FIRE": {
+                "enabled": True, 
+                "description": "检测到火灾", 
+                "severity": "Critical", 
+                "icon": "🔥",
+                "keywords": "火, 烟, fire, smoke, flame"
+            },
+            "VIOLENCE": {
+                "enabled": True, 
+                "description": "检测到暴力", 
+                "severity": "High", 
+                "icon": "👊",
+                "keywords": "打架, 殴打, 暴力, fight, violence, hit, punch"
+            },
+            "INTRUSION": {
+                "enabled": True, 
+                "description": "检测到闯入", 
+                "severity": "High", 
+                "icon": "🚫",
+                "keywords": "闯入, 入侵, 徘徊, intrusion, trespass, loiter"
+            },
+        }
+    }
 }
 
+
+import copy
 
 class ConfigManager:
     """Manages persistent configuration storage."""
     
     def __init__(self, config_path: str = "./config/settings.json"):
         self.config_path = Path(config_path)
-        self._config: Dict[str, Any] = {}
+        self._config: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
         self._load()
     
+    def _deep_update(self, base_dict: Dict, update_dict: Dict):
+        """Recursively update dictionary."""
+        for key, value in update_dict.items():
+            if isinstance(value, dict) and key in base_dict and isinstance(base_dict[key], dict):
+                self._deep_update(base_dict[key], value)
+            else:
+                base_dict[key] = value
+
     def _load(self):
-        """Load config from file or create default."""
+        """Load config from file and merge into defaults."""
         if self.config_path.exists():
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
-                    self._config = json.load(f)
+                    file_config = json.load(f)
+                
+                # Merge file config into defaults
+                self._deep_update(self._config, file_config)
                 logger.info(f"Loaded config from {self.config_path}")
             except Exception as e:
                 logger.error(f"Failed to load config: {e}")
-                self._config = DEFAULT_CONFIG.copy()
+                # Reset to defaults on corruption? Or just keep defaults
+                self._config = copy.deepcopy(DEFAULT_CONFIG)
         else:
-            self._config = DEFAULT_CONFIG.copy()
             self._save()
             logger.info(f"Created default config at {self.config_path}")
     

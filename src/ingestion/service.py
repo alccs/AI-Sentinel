@@ -7,12 +7,14 @@ import os
 import cv2
 import numpy as np
 import re
+import gc
 from typing import Optional, Generator, Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 import logging
 
-from .video_source import VideoSource, FileVideoSource, RTSPVideoSource
+from .video_source import VideoSource, FileVideoSource, RTSPVideoSource, NativeRTSPVideoSource
+from .object_detection import get_object_detector # New Import
 from ..common.types import Frame
 from ..common.queue_manager import queue_manager
 
@@ -26,16 +28,18 @@ class TimeSynchronizer:
     避免阻塞主视频流读取。
     """
     
-    def __init__(self, vlm_client, roi_config: tuple):
+    def __init__(self, vlm_client, roi_config: tuple, frame_provider: Callable[[], Optional[np.ndarray]]):
         """
         初始化时间同步器
         
         Args:
             vlm_client: VLM 客户端实例
             roi_config: ROI 配置 (x_ratio, y_ratio, w_ratio, h_ratio)
+            frame_provider: 获取当前帧的回调函数
         """
         self.vlm_client = vlm_client
         self.roi_config = roi_config
+        self.frame_provider = frame_provider
         
         # 核心时间基准变量
         self.base_video_time: Optional[datetime] = None  # VLM 读到的时间
@@ -46,8 +50,7 @@ class TimeSynchronizer:
         self._sync_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         
-        # 当前帧缓存（用于 VLM 分析）
-        self._current_frame: Optional[np.ndarray] = None
+        # Removed _current_frame cache to avoid copy overhead
         
         # 统计信息
         self._stats = {
@@ -78,10 +81,7 @@ class TimeSynchronizer:
             self._sync_thread = None
         logger.info("TimeSynchronizer stopped")
     
-    def update_frame(self, frame: np.ndarray):
-        """更新当前帧（由主视频循环调用）"""
-        with self._lock:
-            self._current_frame = frame.copy() if frame is not None else None
+    # update_frame removed to avoid copying every frame
     
     def _sync_loop(self):
         """后台同步循环，每 10 秒运行一次"""
@@ -108,11 +108,11 @@ class TimeSynchronizer:
         self._stats["sync_attempts"] += 1
         
         # 获取当前帧
-        with self._lock:
-            if self._current_frame is None:
-                logger.debug("No frame available for sync")
-                return
-            frame = self._current_frame.copy()
+        # 获取当前帧 (Pull on demand)
+        frame = self.frame_provider()
+        if frame is None:
+            logger.debug("No frame available for sync")
+            return
         
         try:
             # 裁剪 ROI 区域
@@ -261,12 +261,16 @@ class VideoIngestionService:
         camera_id: str = "cam_01",
         analysis_interval: float = 1.0,  # Seconds between AI frames
         frame_save_dir: str = "./data/frames",
-        max_queue_size: int = 100,
+        max_queue_size: int = 60,
         loop_video: bool = True,  # Loop for file sources
         max_saved_frames: int = 50,  # Maximum number of saved frame images
         roi_config: tuple = (0.65, 0.85, 0.35, 0.15),  # Time ROI (x, y, w, h) ratios
         vlm_client=None,  # VLM client for time synchronization
         deletion_callback: Optional[Callable[[str], None]] = None, # Callback for sync deletion
+        motion_detection_mode: str = "enhanced",  # Motion detection mode
+        motion_heartbeat: float = 15.0,  # Heartbeat interval in seconds
+        object_detection_enabled: bool = True, # Enable YOLO
+        object_detection_classes: list = None, # Classes to detect
     ):
         self.source = source
         self.camera_id = camera_id
@@ -276,6 +280,12 @@ class VideoIngestionService:
         self.loop_video = loop_video
         self.max_saved_frames = max_saved_frames
         self.deletion_callback = deletion_callback
+        self.motion_detection_mode = motion_detection_mode
+        self.motion_heartbeat = motion_heartbeat
+        
+        # Object Detection Config
+        self.object_detection_enabled = object_detection_enabled
+        self.object_detection_classes = object_detection_classes if object_detection_classes else ["person", "vehicle", "animal"]
         
         self._saved_files = [] # Track files for FIFO cleanup
         
@@ -300,13 +310,24 @@ class VideoIngestionService:
         self._processing_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         
-        # Background processing frame queue
+        # Stats processing queue
         import queue
         self._processing_queue = queue.Queue(maxsize=max_queue_size)
         
+        # Buffering state for Best-Frame Selection
+        self._is_buffering = False
+        self._frame_buffer = [] # List of (frame, score, timestamp)
+        self._buffer_start_time = 0.0
+        self._buffer_duration = 0.4 # Buffer window in seconds
+        
         # 初始化 VLM 时间同步器（替换 OCR）
         if vlm_client is not None:
-            self.time_synchronizer = TimeSynchronizer(vlm_client, roi_config)
+            # Use self.get_current_frame as provider (thread-safe copy)
+            self.time_synchronizer = TimeSynchronizer(
+                vlm_client, 
+                roi_config, 
+                frame_provider=self.get_current_frame
+            )
             logger.info("VLM-based time synchronization enabled")
         else:
             self.time_synchronizer = None
@@ -317,6 +338,7 @@ class VideoIngestionService:
         self._frame_number = 0
         self._last_analysis_time = 0.0
         self._frames_for_analysis = 0
+        self.motion_detector = None # Expose for stats access
         self._saved_frame_index = 0  # Circular buffer index
         
         # Statistics
@@ -357,8 +379,23 @@ class VideoIngestionService:
     @classmethod
     def from_rtsp(cls, rtsp_url: str, **kwargs) -> 'VideoIngestionService':
         """Factory method to create service from RTSP stream."""
-        source = RTSPVideoSource(rtsp_url)
+        # source = RTSPVideoSource(rtsp_url) 
+        source = NativeRTSPVideoSource(rtsp_url) # Use optimized native source
         return cls(source, **kwargs)
+    
+    def get_motion_stats(self) -> dict:
+        """Get motion detection statistics (if available)."""
+        if self.motion_detector:
+             return self.motion_detector.get_stats()
+             
+        # Fallback if not initialized yet
+        return {
+            "mode": getattr(self, "motion_detection_mode", "enhanced"),
+            "threshold": getattr(self, "motion_threshold", 5.0),
+            "heartbeat": getattr(self, "motion_heartbeat", 15.0),
+            "obj_det_enabled": getattr(self, "object_detection_enabled", True),
+            "status": "initializing"
+        }
     
     def start(self):
         """Start the ingestion service in a background thread."""
@@ -415,19 +452,55 @@ class VideoIngestionService:
         return self._running
     
     def _capture_loop(self):
-        """Main capture loop running in background thread."""
+        """Main capture loop running in background thread with Enhanced Motion Gating."""
         fps = self.source.get_fps()
         frame_interval = 1.0 / fps if fps > 0 else 1.0 / 30.0
         
-        # Calculate how many frames to skip between analysis
-        analysis_frame_interval = int(self.analysis_interval * fps)
-        logger.info(f"Capture loop: FPS={fps:.1f}, Analysis every {analysis_frame_interval} frames")
+        # Enhanced Motion Gating Configuration
+        from .motion import EnhancedMotionDetector
+        
+        # 动态读取配置
+        motion_mode = getattr(self, "motion_detection_mode", "enhanced")
+        self.motion_detector = EnhancedMotionDetector(mode=motion_mode, grid_size=6)
+        motion_detector = self.motion_detector # Local alias for compatibility
+        
+        # 初始化时读取配置
+        motion_threshold = getattr(self, "motion_threshold", 5.0)
+        min_interval = getattr(self, "analysis_interval", 1.0)
+        heartbeat_interval = getattr(self, "motion_heartbeat", 15.0)
+        
+        # 初始化 last_analysis_time 为当前时间减去心跳间隔，确保第一次会触发心跳
+        last_analysis_time = time.time() - heartbeat_interval
+        
+        logger.info(f"Capture loop started: FPS={fps:.1f}, Mode={motion_mode}, Threshold={motion_threshold}%, Interval={min_interval}s, Heartbeat={heartbeat_interval}s")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [CAM] Capture loop started: FPS={fps:.1f}, Mode={motion_mode}, Threshold={motion_threshold}%, Interval={min_interval}s, Heartbeat={heartbeat_interval}s", flush=True)
+        
+        # Ensure flushing
+        import sys
         
         while self._running:
             loop_start = time.time()
             
             # Read frame
-            success, frame = self.source.read_frame()
+            try:
+                success, frame = self.source.read_frame()
+            except cv2.error as e:
+                if "Insufficient memory" in str(e):
+                    logger.error(f"OpenCV OOM: {e}. Triggering GC.")
+                    print("⚠️ System running low on memory, performing cleanup...", flush=True)
+                    gc.collect()
+                    time.sleep(0.5)
+                    continue
+                else:
+                    logger.error(f"OpenCV error: {e}")
+                    # Allow non-fatal errors to continue unless critical? 
+                    # For now, treat unknown cv2 errors as transient or check running
+                    time.sleep(0.1)
+                    continue
+            except Exception as e:
+                logger.error(f"Unexpected error in read_frame: {e}")
+                time.sleep(1)
+                continue
             
             if not success or frame is None:
                 # Handle end of file or stream error
@@ -444,16 +517,9 @@ class VideoIngestionService:
                     # RTSP stream error
                     if not self._running:
                         break
-
-                    # print("❌ 视频流读取中断，尝试重连...")
                     logger.warning("Stream read error, attempting reconnect...")
-                    time.sleep(1) # Prevent busy loop
-                    
-                    if not self._running:
-                        break
-
+                    time.sleep(1) 
                     if hasattr(self.source, 'reconnect'):
-                        # Try to reopen
                         try:
                             self.source.reconnect()
                             if not self._running:
@@ -462,35 +528,93 @@ class VideoIngestionService:
                             print("✅ 视频流重连成功！")
                         except Exception as e:
                             logger.error(f"Reconnect failed: {e}")
-                            print(f"⚠️ 重连失败: {e}")
                             time.sleep(2)
                     continue
             
             self._frame_number += 1
             self._stats["total_frames"] += 1
             
-            # Update current frame for UI streaming (always)
+            # Update current frame for UI streaming
             with self._lock:
-                self._current_frame = frame.copy()
+                self._current_frame = frame
             
-            # 更新时间同步器的当前帧
-            if self.time_synchronizer:
-                self.time_synchronizer.update_frame(frame)
-            
-            # Decimation: Check if this frame should be sent for AI analysis
+            # --- Enhanced Motion Gating Logic ---
             current_time = time.time()
-            time_since_last = current_time - self._last_analysis_time
+            time_since_last = current_time - last_analysis_time
             
-            if time_since_last >= self.analysis_interval:
-                # Send copy to valid race condition on image buffer modification
-                self._send_for_analysis(frame.copy(), current_time)
-                self._last_analysis_time = current_time
+            # 动态读取配置（支持热更新）
+            motion_threshold = getattr(self, "motion_threshold", 5.0)
+            min_interval = getattr(self, "analysis_interval", 1.0)
+            heartbeat_interval = getattr(self, "motion_heartbeat", 15.0)
+            motion_mode = getattr(self, "motion_detection_mode", "enhanced")
             
+            # Update detector mode if changed
+            if motion_detector.mode != motion_mode:
+                logger.info(f"Switching motion detection mode: {motion_detector.mode} -> {motion_mode}")
+                motion_detector.mode = motion_mode
+            
+            # 1. Check Rate Limit (Must satisfy min interval)
+            # Note: During buffering, last_analysis_time is NOT updated, so we keep entering this block
+            if time_since_last >= min_interval:
+                # 2. Calculate Motion Score
+                motion_score = motion_detector.detect(frame, motion_threshold)
+                
+                # Check Buffering State
+                if self._is_buffering:
+                    # Collect frame for buffer
+                    self._frame_buffer.append((frame.copy(), motion_score, current_time))
+                    
+                    # Check if buffer is full (time based)
+                    if current_time - self._buffer_start_time >= self._buffer_duration:
+                        # Select best frame (highest motion score)
+                        if self._frame_buffer:
+                            # Use max score. If scores equal, later frame is preferred (stable sort? No, simple max)
+                            best_frame, best_score, best_ts = max(self._frame_buffer, key=lambda x: x[1])
+                            
+                            logger.info(f"[CAM] Best frame selected: Score={best_score:.1f}% (from {len(self._frame_buffer)} buffered frames)")
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] [CAM] Best frame selected: Score={best_score:.1f}% (from {len(self._frame_buffer)} buffered frames)", flush=True)
+                            
+                            # Send best frame
+                            self._send_for_analysis(best_frame, best_ts)
+                            last_analysis_time = current_time # Update timer only after sending
+                        
+                        # Reset buffer
+                        self._is_buffering = False
+                        self._frame_buffer = []
+
+                else:
+                    # 3. Intelligent trigger decision
+                    should_analyze, reason = motion_detector.should_trigger(
+                        motion_score, 
+                        motion_threshold, 
+                        time_since_last, 
+                        heartbeat_interval
+                    )
+                    
+                    # 4. Enhanced Logging & Trigger Logic
+                    if should_analyze:
+                        # Start Buffering instead of sending immediately
+                        self._is_buffering = True
+                        self._buffer_start_time = current_time
+                        self._frame_buffer = [(frame.copy(), motion_score, current_time)]
+                        
+                        logger.info(f"[CAM] Motion: {motion_score:.2f}% (Threshold: {motion_threshold:.1f}%) -> TRIGGER ({reason}). Buffering...")
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [CAM] Motion: {motion_score:.2f}% (Threshold: {motion_threshold:.1f}%) -> ✅ TRIGGER ({reason}). Buffering {self._buffer_duration}s...", flush=True)
+                        
+                    elif motion_score > 0.1:
+                        # Format: [CAM] Motion: XX.XX% (Threshold: YY.Y%) -> IGNORE
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [CAM] Motion: {motion_score:.2f}% (Threshold: {motion_threshold:.1f}%) -> ⏭️  IGNORE", flush=True)
+
             # Maintain frame rate
             elapsed = time.time() - loop_start
             sleep_time = frame_interval - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
+        
+        # Print final statistics
+        stats = motion_detector.get_stats()
+        logger.info(f"Motion detector stats: {stats}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [CAM] Motion detector final stats: {stats}", flush=True)
         
         self._running = False
         logger.info("Capture loop ended")
@@ -537,6 +661,34 @@ class VideoIngestionService:
                 # 1. 使用 VLM 时间同步器获取当前视频时间
                 video_time = self.get_current_video_time()
                 final_ts = video_time.timestamp()
+
+                # --- NEW: Object Detection (YOLO) ---
+                # Load Shedding: Skip YOLO if queue is backing up (>5 frames pending)
+                # This prevents VLM analysis from being starved by object detection lag
+                if getattr(self, "object_detection_enabled", True):
+                    # Check queue size (approximate)
+                    current_qsize = self._processing_queue.qsize() if hasattr(self._processing_queue, 'qsize') else 0
+                    
+                    if current_qsize > 5:
+                        logger.warning(f"High load (qsize={current_qsize}), skipping YOLO for frame {frame_num}")
+                    else:
+                        try:
+                            classes = getattr(self, "object_detection_classes", ["person", "vehicle", "animal"])
+                            detector = get_object_detector()
+                            # detector handles lazy loading
+                            annotated_frame, det_stats = detector.detect_and_annotate(
+                                frame, 
+                                conf=0.45, # Slightly lower threshold for recall
+                                classes=classes
+                            )
+                            if "error" not in det_stats:
+                                # Use the annotated frame for saving
+                                frame = annotated_frame
+                                if det_stats["count"] > 0:
+                                    logger.info(f"YOLO Detected: {det_stats['objects']}")
+                        except Exception as e:
+                            logger.error(f"Object detection failed (non-fatal): {e}")
+                # -------------------------------------
 
                 # 2. Date-based Save
                 date_str = video_time.strftime("%Y-%m-%d")
@@ -595,10 +747,18 @@ class VideoIngestionService:
         
         logger.info("Processing loop ended")
     
-    def get_current_frame(self) -> Optional[np.ndarray]:
-        """Get the most recent frame (for single-frame access)."""
+    def get_current_frame(self, copy: bool = True) -> Optional[np.ndarray]:
+        """
+        Get the most recent frame.
+        
+        Args:
+            copy: If True, return a copy (safe for modification). 
+                  If False, return direct reference (faster, read-only).
+        """
         with self._lock:
-            return self._current_frame.copy() if self._current_frame is not None else None
+            if self._current_frame is None:
+                return None
+            return self._current_frame.copy() if copy else self._current_frame
     
     def stream_frames(self, target_fps: float = 30.0) -> Generator[np.ndarray, None, None]:
         """

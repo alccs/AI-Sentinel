@@ -34,9 +34,10 @@ class GlobalQueueManager:
         self._initialized = True
         
         # Pre-create standard queues
-        self.create_queue("frame_queue", maxsize=100)      # Frames for AI analysis
-        self.create_queue("alert_queue", maxsize=50)       # Detected alerts
-        self.create_queue("result_queue", maxsize=100)     # Analysis results
+        # Pre-create standard queues
+        self.create_queue("frame_queue", maxsize=500)      # Frames for AI analysis (Increased)
+        self.create_queue("alert_queue", maxsize=500)      # Detected alerts (Increased)
+        self.create_queue("result_queue", maxsize=500)     # Analysis results (Increased)
         
         logger.info("GlobalQueueManager initialized with standard queues")
     
@@ -68,7 +69,7 @@ class GlobalQueueManager:
             try:
                 queue.get_nowait()
                 queue.put(item, block=block, timeout=timeout)
-                logger.warning(f"Queue '{queue_name}' full: dropped oldest item to add new one.")
+                logger.debug(f"Queue '{queue_name}' full: dropped oldest item to add new one.")
                 return True
             except (Empty, Full):
                 # Extremely rare race condition or still full

@@ -83,7 +83,7 @@ class VectorStore:
         doc_metadata = {
             "frame_id": frame_id,
             "camera_id": camera_id,
-            "timestamp": timestamp,
+            "timestamp": float(timestamp),
             "image_path": image_path,
             "capture_time": datetime.now().isoformat(),
         }
@@ -114,6 +114,138 @@ class VectorStore:
             logger.info(f"Deleted document: {doc_id}")
         except Exception as e:
             logger.error(f"Error deleting document {doc_id}: {e}")
+
+    def delete_by_date(self, date_str: str):
+        """
+        Delete all documents for a specific date.
+        
+        Args:
+            date_str: Date string in 'YYYY-MM-DD' format
+        """
+        try:
+            # Parse date and create timestamp range
+            target_date = datetime.strptime(date_str, "%Y-%m-%d")
+            
+            # Safe timestamp calculation for Windows pre-epoch support
+            try:
+                start_ts = target_date.timestamp()
+            except OSError:
+                # Fallback: calculate using safe offset (e.g. from 2000-01-01)
+                safe_base = datetime(2000, 1, 1)
+                safe_ts_base = safe_base.timestamp()
+                delta = (safe_base - target_date).total_seconds()
+                start_ts = safe_ts_base - delta
+                
+            # End of day (next day - 1 microsecond) or just < next day
+            end_ts = start_ts + 86400.0
+            
+            # Delete using where filter on timestamp
+            self._collection.delete(
+                where={
+                    "$and": [
+                        {"timestamp": {"$gte": start_ts}},
+                        {"timestamp": {"$lt": end_ts}}
+                    ]
+                }
+            )
+            logger.info(f"Deleted documents for date: {date_str}")
+        except Exception as e:
+            logger.error(f"Error deleting documents for date {date_str}: {e}")
+            raise e
+
+
+    def delete_by_hour(self, date_str: str, hour: int):
+        """
+        Delete all documents for a specific hour on a specific date.
+        
+        Args:
+            date_str: Date string in 'YYYY-MM-DD' format
+            hour: Hour (0-23)
+        """
+        try:
+            # Parse date
+            target_date = datetime.strptime(date_str, "%Y-%m-%d")
+            
+            # Safe timestamp calculation
+            try:
+                base_ts = target_date.timestamp()
+            except OSError:
+                safe_base = datetime(2000, 1, 1)
+                safe_ts_base = safe_base.timestamp()
+                delta = (safe_base - target_date).total_seconds()
+                base_ts = safe_ts_base - delta
+            
+            # Calculate range for the specific hour
+            start_ts = base_ts + (hour * 3600.0)
+            end_ts = start_ts + 3600.0
+            
+            # Delete using where filter
+            self._collection.delete(
+                where={
+                    "$and": [
+                        {"timestamp": {"$gte": start_ts}},
+                        {"timestamp": {"$lt": end_ts}}
+                    ]
+                }
+            )
+            logger.info(f"Deleted documents for {date_str} hour {hour}")
+        except Exception as e:
+            logger.error(f"Error deleting documents for {date_str} hour {hour}: {e}")
+            raise e
+
+    def get_documents_by_date(self, date_str: str) -> List[Dict[str, Any]]:
+        """
+        Get all documents for a specific date.
+        
+        Args:
+            date_str: Date string in 'YYYY-MM-DD' format
+            
+        Returns:
+            List of documents with details
+        """
+        try:
+            # Parse date and create timestamp range
+            target_date = datetime.strptime(date_str, "%Y-%m-%d")
+            
+            # Safe timestamp calculation
+            try:
+                start_ts = target_date.timestamp()
+            except OSError:
+                safe_base = datetime(2000, 1, 1)
+                safe_ts_base = safe_base.timestamp()
+                delta = (safe_base - target_date).total_seconds()
+                start_ts = safe_ts_base - delta
+                
+            end_ts = start_ts + 86400.0
+            
+            # Query
+            results = self._collection.get(
+                where={
+                    "$and": [
+                        {"timestamp": {"$gte": start_ts}},
+                        {"timestamp": {"$lt": end_ts}}
+                    ]
+                },
+                include=["documents", "metadatas"]
+            )
+            
+            entries = []
+            if results and results["ids"]:
+                for i, doc_id in enumerate(results["ids"]):
+                    entries.append({
+                        "id": doc_id,
+                        "description": results["documents"][i],
+                        "metadata": results["metadatas"][i]
+                    })
+            
+            # Sort by capture time descending
+            entries.sort(key=lambda x: x["metadata"].get("capture_time", ""), reverse=True)
+            return entries
+            
+        except Exception as e:
+            logger.error(f"Error fetching documents for date {date_str}: {e}")
+            return []
+
     
     def search(
         self,
@@ -121,6 +253,8 @@ class VectorStore:
         n_results: int = 10,
         camera_id: Optional[str] = None,
         time_range: Optional[tuple] = None,  # (start_ts, end_ts)
+        min_score: Optional[float] = None,  # Minimum similarity score (0-1)
+        sort_by: str = "similarity",  # "similarity" or "time"
     ) -> List[Dict[str, Any]]:
         """
         Search for frames matching the query.
@@ -130,6 +264,8 @@ class VectorStore:
             n_results: Maximum number of results
             camera_id: Optional filter by camera
             time_range: Optional filter by timestamp range (start_ts, end_ts)
+            min_score: Optional minimum similarity score (0-1), filters out low-relevance results
+            sort_by: "similarity" (default) or "time" (prioritize latest)
             
         Returns:
             List of results with description, metadata, and distance
@@ -141,10 +277,10 @@ class VectorStore:
         
         if time_range:
             filters.append({
-                "timestamp": {
-                    "$gte": time_range[0],
-                    "$lte": time_range[1]
-                }
+                "$and": [
+                    {"timestamp": {"$gte": time_range[0]}},
+                    {"timestamp": {"$lte": time_range[1]}}
+                ]
             })
             
         if len(filters) > 1:
@@ -154,36 +290,120 @@ class VectorStore:
         else:
             where_filter = None
         
-        # Query collection
-        results = self._collection.query(
-            query_texts=[query],
-            n_results=n_results,
-            where=where_filter,
-            include=["documents", "metadatas", "distances"],
-        )
+        results_map = {}
         
-        # Format results
-        formatted = []
-        if results and results["ids"] and results["ids"][0]:
-            for i, doc_id in enumerate(results["ids"][0]):
-                result = {
+        # Determine fetch limit
+        # If sorting by time, we need to fetch more candidates to ensure we capture recent ones
+        # even if their similarity score isn't in the global top N.
+        # We fetch 5x requested results to form a pool.
+        fetch_limit = n_results * 5 if sort_by == "time" else n_results
+        
+        # 1. Vector Search
+        try:
+            vec_results = self._collection.query(
+                query_texts=[query],
+                n_results=fetch_limit,
+                where=where_filter,
+                include=["documents", "metadatas", "distances"],
+            )
+            
+            if vec_results and vec_results["ids"] and vec_results["ids"][0]:
+                for i, doc_id in enumerate(vec_results["ids"][0]):
+                    dist = vec_results["distances"][0][i] if vec_results.get("distances") else 1.0
+                    sim = max(0, 1 - dist / 2)
+                    
+                    results_map[doc_id] = {
+                        "id": doc_id,
+                        "description": vec_results["documents"][0][i],
+                        "metadata": vec_results["metadatas"][0][i],
+                        "distance": dist,
+                        "similarity": sim,
+                    }
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}")
+
+        # 2. Multi-Keyword Search with Chinese Segmentation
+        # Use jieba for Chinese tokenization to improve matching
+        # Important single-char nouns that should be preserved
+        IMPORTANT_SINGLE_CHARS = {'猫', '狗', '人', '车', '鸟', '树', '门', '窗', '狼', '熊', '牛', '羊', '马', '鸡', '鸭', '鹅'}
+        
+        try:
+            import jieba
+            keywords = [k.strip() for k in jieba.cut(query) 
+                       if k.strip() and (len(k.strip()) > 1 or k.strip() in IMPORTANT_SINGLE_CHARS)]
+        except ImportError:
+            # Fallback: split by space or use whole query
+            keywords = [k.strip() for k in query.split() if k.strip()]
+            if not keywords and query.strip():
+                keywords = [query.strip()]
+        
+        logger.debug(f"Keyword search with terms: {keywords}")
+        
+        # Search for each keyword and merge results
+        keyword_hits = {}  # doc_id -> hit_count
+        keyword_docs = {}  # doc_id -> doc_data
+        
+        for kw in keywords[:5]:  # Limit to first 5 keywords for performance
+            try:
+                kw_results = self._collection.get(
+                    where=where_filter,
+                    where_document={"$contains": kw},
+                    include=["documents", "metadatas"],
+                    limit=fetch_limit
+                )
+                
+                if kw_results and kw_results["ids"]:
+                    for i, doc_id in enumerate(kw_results["ids"]):
+                        keyword_hits[doc_id] = keyword_hits.get(doc_id, 0) + 1
+                        if doc_id not in keyword_docs:
+                            keyword_docs[doc_id] = {
+                                "id": doc_id,
+                                "description": kw_results["documents"][i],
+                                "metadata": kw_results["metadatas"][i],
+                            }
+            except Exception as e:
+                logger.warning(f"Keyword search for '{kw}' failed: {e}")
+        
+        # Merge keyword matches into results
+        total_keywords = len(keywords) if keywords else 1
+        for doc_id, hit_count in keyword_hits.items():
+            # Calculate similarity based on how many keywords matched
+            keyword_similarity = 0.5 + (hit_count / total_keywords) * 0.45  # Range: 0.5 ~ 0.95
+            
+            if doc_id not in results_map:
+                doc_data = keyword_docs[doc_id]
+                results_map[doc_id] = {
                     "id": doc_id,
-                    "description": results["documents"][0][i],
-                    "metadata": results["metadatas"][0][i],
-                    "distance": results["distances"][0][i] if results.get("distances") else None,
+                    "description": doc_data["description"],
+                    "metadata": doc_data["metadata"],
+                    "distance": 2 * (1 - keyword_similarity),
+                    "similarity": keyword_similarity,
+                    "_keyword_hits": hit_count,
                 }
-                
-                # Double check time range filter (safety net if ChromaDB version is old)
-                if time_range:
-                    ts = result["metadata"].get("timestamp", 0)
-                    if not (time_range[0] <= ts <= time_range[1]):
-                        # Should have been filtered by where_filter, but just in case
-                        continue
-                
-                formatted.append(result)
+            else:
+                # Boost existing entry if keywords matched
+                boost = 0.1 + (hit_count / total_keywords) * 0.1  # 0.1 ~ 0.2 boost
+                results_map[doc_id]["similarity"] = min(0.99, results_map[doc_id]["similarity"] + boost)
+                results_map[doc_id]["distance"] = 2 * (1 - results_map[doc_id]["similarity"])
+                results_map[doc_id]["_keyword_hits"] = hit_count
+
+        # Convert map to list
+        formatted = list(results_map.values())
         
-        logger.info(f"Search '{query}' returned {len(formatted)} results")
-        return formatted
+        # Filter by min_score if specified
+        if min_score is not None:
+            formatted = [r for r in formatted if r["similarity"] >= min_score]
+            
+        # Final Sort
+        if sort_by == "time":
+            # Sort by timestamp descending
+            formatted.sort(key=lambda x: x["metadata"].get("timestamp", 0), reverse=True)
+        else:
+            # Sort by similarity desc
+            formatted.sort(key=lambda x: x["similarity"], reverse=True)
+            
+        logger.info(f"Hybrid Search '{query}' returned {len(formatted)} results (sort={sort_by})")
+        return formatted[:n_results]
     
     def get_by_frame_id(self, frame_id: str, camera_id: str = "default") -> Optional[Dict[str, Any]]:
         """Get a specific frame by ID."""
@@ -418,7 +638,7 @@ class VisualVectorStore:
         doc_metadata = {
             "frame_id": frame_id,
             "camera_id": camera_id,
-            "timestamp": timestamp,
+            "timestamp": float(timestamp),
             "image_path": image_path,
             "description": description,
             "alert_info": alert_info,
@@ -458,6 +678,8 @@ class VisualVectorStore:
         n_results: int = 10,
         camera_id: Optional[str] = None,
         time_range: Optional[tuple] = None,
+        min_score: Optional[float] = None,  # Minimum similarity score (0-1)
+        sort_by: str = "similarity",  # "similarity" or "time"
     ) -> List[Dict[str, Any]]:
         """
         Search for frames using an embedding vector.
@@ -467,6 +689,8 @@ class VisualVectorStore:
             n_results: Maximum number of results
             camera_id: Optional filter by camera
             time_range: Optional filter by timestamp range (start_ts, end_ts)
+            min_score: Optional minimum similarity score (0-1), filters out low-relevance results
+            sort_by: "similarity" or "time"
             
         Returns:
             List of results with metadata and similarity scores
@@ -478,10 +702,10 @@ class VisualVectorStore:
         
         if time_range:
             filters.append({
-                "timestamp": {
-                    "$gte": time_range[0],
-                    "$lte": time_range[1]
-                }
+                "$and": [
+                    {"timestamp": {"$gte": time_range[0]}},
+                    {"timestamp": {"$lte": time_range[1]}}
+                ]
             })
             
         if len(filters) > 1:
@@ -496,11 +720,14 @@ class VisualVectorStore:
             query_list = list(query_embedding)
         else:
             query_list = query_embedding
+            
+        # Determine fetch limit based on sort logic
+        fetch_limit = n_results * 5 if sort_by == "time" else n_results
         
         # Query collection
         results = self._collection.query(
             query_embeddings=[query_list],
-            n_results=n_results,
+            n_results=fetch_limit,
             where=where_filter,
             include=["documents", "metadatas", "distances"],
         )
@@ -509,14 +736,22 @@ class VisualVectorStore:
         formatted = []
         if results and results["ids"] and results["ids"][0]:
             for i, doc_id in enumerate(results["ids"][0]):
+                distance = results["distances"][0][i] if results.get("distances") else None
+                # Convert distance to similarity (cosine distance to similarity)
+                similarity = 1 - distance if distance is not None else None
+                
                 result = {
                     "id": doc_id,
                     "description": results["documents"][0][i] if results.get("documents") else "",
                     "metadata": results["metadatas"][0][i] if results.get("metadatas") else {},
-                    "distance": results["distances"][0][i] if results.get("distances") else None,
-                    # Convert distance to similarity (cosine distance to similarity)
-                    "similarity": 1 - results["distances"][0][i] if results.get("distances") else None,
+                    "distance": distance,
+                    "similarity": similarity,
                 }
+                
+                # Filter by min_score if specified
+                if min_score is not None and similarity is not None:
+                    if similarity < min_score:
+                        continue
                 
                 # Apply time range filter
                 if time_range:
@@ -526,8 +761,12 @@ class VisualVectorStore:
                 
                 formatted.append(result)
         
-        logger.info(f"Semantic search returned {len(formatted)} results")
-        return formatted
+        # Sort if needed (Query already returns sorted by distance/similarity, so only time sort needed)
+        if sort_by == "time":
+            formatted.sort(key=lambda x: x["metadata"].get("timestamp", 0), reverse=True)
+            
+        logger.info(f"Semantic search returned {len(formatted)} results (sort={sort_by})")
+        return formatted[:n_results]
     
     def search_by_text(
         self,
@@ -543,7 +782,7 @@ class VisualVectorStore:
             embedder: TextEmbedder instance
             query_text: Text search query
             n_results: Maximum results
-            **kwargs: Additional filters (camera_id, time_range)
+            **kwargs: Additional filters (camera_id, time_range, min_score, sort_by)
             
         Returns:
             List of search results
@@ -588,11 +827,93 @@ class VisualVectorStore:
         except Exception as e:
             # Try with semantic prefix
             try:
-                semantic_id = f"semantic_default_{doc_id}" if not doc_id.startswith("semantic_") else doc_id
+                # Fix: Handle doc_id that might already include camera_id but lack semantic prefix
+                # If doc_id is "cam_01_123", we want "semantic_cam_01_123"
+                semantic_id = f"semantic_{doc_id}" if not doc_id.startswith("semantic_") else doc_id
                 self._collection.delete(ids=[semantic_id])
                 logger.info(f"Deleted document from visual store: {semantic_id}")
             except Exception as e2:
                 logger.debug(f"Document not found in visual store: {doc_id} - {e2}")
+
+    def delete_by_date(self, date_str: str):
+        """
+        Delete all documents for a specific date from visual store.
+        
+        Args:
+            date_str: Date string in 'YYYY-MM-DD' format
+        """
+        try:
+            from datetime import datetime
+            # Parse date and create timestamp range
+            target_date = datetime.strptime(date_str, "%Y-%m-%d")
+            
+            # Safe timestamp calculation for Windows pre-epoch support
+            try:
+                start_ts = target_date.timestamp()
+            except OSError:
+                # Fallback: calculate using safe offset (e.g. from 2000-01-01)
+                safe_base = datetime(2000, 1, 1)
+                safe_ts_base = safe_base.timestamp()
+                delta = (safe_base - target_date).total_seconds()
+                start_ts = safe_ts_base - delta
+                
+            end_ts = start_ts + 86400.0
+            
+            # Delete using where filter on timestamp
+            self._collection.delete(
+                where={
+                    "$and": [
+                        {"timestamp": {"$gte": start_ts}},
+                        {"timestamp": {"$lt": end_ts}}
+                    ]
+                }
+            )
+            logger.info(f"Deleted visual documents for date: {date_str}")
+        except Exception as e:
+            logger.error(f"Error deleting visual documents for date {date_str}: {e}")
+            raise e
+
+
+    def delete_by_hour(self, date_str: str, hour: int):
+        """
+        Delete all documents for a specific hour on a specific date from visual store.
+        
+        Args:
+            date_str: Date string in 'YYYY-MM-DD' format
+            hour: Hour (0-23)
+        """
+        try:
+            from datetime import datetime
+            
+            # Parse date
+            target_date = datetime.strptime(date_str, "%Y-%m-%d")
+            
+            # Safe timestamp calculation
+            try:
+                base_ts = target_date.timestamp()
+            except OSError:
+                safe_base = datetime(2000, 1, 1)
+                safe_ts_base = safe_base.timestamp()
+                delta = (safe_base - target_date).total_seconds()
+                base_ts = safe_ts_base - delta
+            
+            # Calculate range for the specific hour
+            start_ts = base_ts + (hour * 3600.0)
+            end_ts = start_ts + 3600.0
+            
+            # Delete using where filter
+            self._collection.delete(
+                where={
+                    "$and": [
+                        {"timestamp": {"$gte": start_ts}},
+                        {"timestamp": {"$lt": end_ts}}
+                    ]
+                }
+            )
+            logger.info(f"Deleted visual documents for {date_str} hour {hour}")
+        except Exception as e:
+            logger.error(f"Error deleting visual documents for {date_str} hour {hour}: {e}")
+            raise e
     
     def clear(self):
         """Clear all documents from the collection."""

@@ -1,0 +1,151 @@
+{
+  "video_source": {
+    "type": "file",
+    "path": "",
+    "path_rtsp": "",
+    "path_file": ""
+  },
+  "vlm": {
+    "api_url": "http://127.0.0.1:1234/v1",
+    "api_key": "",
+    "model_name": "qwen3.5-2b",
+    "system_prompt": "",
+    "presets": {
+      "OpenAI": {
+        "api_url": "https://api.openai.com/v1",
+        "api_key": "",
+        "model_name": "gpt-4o"
+      },
+      "Local (Ollama)": {
+        "api_url": "http://localhost:11434/v1",
+        "api_key": "ollama",
+        "model_name": "qwen2-vl"
+      },
+      "SiliconFlow": {
+        "api_url": "https://api.siliconflow.cn/v1",
+        "api_key": "",
+        "model_name": "Qwen/Qwen2-VL-72B-Instruct"
+      },
+      "LM Studio": {
+        "api_url": "http://127.0.0.1:1234/v1",
+        "api_key": "",
+        "model_name": "qwen/qwen3-vl-4b"
+      },
+      "ModelScope": {
+        "api_url": "https://api-inference.modelscope.cn/v1",
+        "api_key": "",
+        "model_name": "Qwen/Qwen3-VL-235B-A22B-Instruct"
+      }
+    }
+  },
+  "embedding": {
+    "provider": "api",
+    "api_url": "http://127.0.0.1:11434/v1",
+    "api_key": "",
+    "model_name": "embeddinggemma:latest",
+    "local_model_path": ""
+  },
+  "analysis": {
+    "interval": 2.0,
+    "motion_threshold": 5.5,
+    "motion_detection_mode": "intelligent",
+    "motion_heartbeat": 0.0,
+    "obj_det_enabled": false,
+    "obj_det_classes": [
+      "person",
+      "animal"
+    ],
+    "context_size": 0
+  },
+  "ocr": {
+    "roi": [
+      0.68,
+      0.92,
+      0.29,
+      0.06
+    ],
+    "enable_time_sync": false
+  },
+  "storage": {
+    "max_saved_frames": 3000
+  },
+  "alarms": {
+    "rules": {
+      "PERSON": {
+        "enabled": true,
+        "description": "检测到人",
+        "severity": "Info",
+        "icon": "👤",
+        "keywords": "人,行人,有人"
+      },
+      "DOG": {
+        "enabled": false,
+        "description": "检测到狗",
+        "severity": "Info",
+        "icon": "🐕",
+        "keywords": "狗,犬,宠物狗"
+      },
+      "CAT": {
+        "enabled": true,
+        "description": "检测到猫",
+        "severity": "Info",
+        "icon": "🐱",
+        "keywords": "猫"
+      },
+      "CAR": {
+        "enabled": false,
+        "description": "检测到车辆",
+        "severity": "Info",
+        "icon": "🚗",
+        "keywords": "车,汽车,轿车,卡车,SUV"
+      },
+      "CHICKEN": {
+        "enabled": false,
+        "description": "检测到鸡",
+        "severity": "Info",
+        "icon": "🐔",
+        "keywords": "鸡"
+      },
+      "FALL": {
+        "enabled": true,
+        "description": "检测到跌倒",
+        "severity": "Critical",
+        "icon": "⚠️",
+        "keywords": "摔倒,倒地,躺"
+      },
+      "FIRE": {
+        "enabled": true,
+        "description": "检测到火灾",
+        "severity": "Critical",
+        "icon": "🔥",
+        "keywords": "火,烟,火焰,着火"
+      },
+      "VIOLENCE": {
+        "enabled": true,
+        "description": "检测到暴力",
+        "severity": "High",
+        "icon": "👊",
+        "keywords": ""
+      },
+      "INTRUSION": {
+        "enabled": true,
+        "description": "检测到闯入",
+        "severity": "High",
+        "icon": "🚫",
+        "keywords": ""
+      }
+    },
+    "mode": "keyword",
+    "max_images": 300
+  },
+  "notification": {
+    "enabled": false,
+    "provider": "wechat",
+    "wechat_appid": "",
+    "wechat_secret": "",
+    "wechat_openid": "",
+    "wechat_template_id": "",
+    "bark_key": "",
+    "cooldown": 60
+  }
+}
